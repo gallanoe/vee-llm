@@ -15,7 +15,11 @@ class Benchmark(StrEnum):
 
 
 def inference(
-    prompt: str, tokens: int, device: str, benchmark: Benchmark = Benchmark.OFF
+    prompt: str,
+    tokens: int,
+    device: str,
+    cache_enabled: bool = True,
+    benchmark: Benchmark = Benchmark.OFF,
 ) -> str:
     load_start = time.perf_counter()
     gpt = GPT2.from_pretrained(device)
@@ -29,37 +33,59 @@ def inference(
     result = prompt
     token_ids = tokenizer.encode(prompt)
 
-    step_times = []
     ttft = None
     gen_start = time.perf_counter()
 
+    # Prefill
+    kv_cache = None
+    if cache_enabled and benchmark == Benchmark.OFF:
+        input = torch.tensor(token_ids[:-1]).unsqueeze(0).to(device)
+        _, kv_cache = gpt(input)
+    # TODO: Fix synchronize benchmark setting
+    elif cache_enabled and benchmark != Benchmark.OFF:
+        input = torch.tensor(token_ids[:-1]).unsqueeze(0).to(device)
+        synchronize(device)
+        _, kv_cache = gpt(input)
+        synchronize(device)
+    pos = len(token_ids) - 1
+
     with torch.no_grad():
         for i in range(tokens):
-            input = torch.tensor(token_ids).unsqueeze(0).to(device)
+            if cache_enabled:
+                input = torch.tensor([token_ids[-1]]).unsqueeze(0).to(device)
+            else:
+                input = torch.tensor(token_ids).unsqueeze(0).to(device)
 
             if benchmark != Benchmark.OFF:
                 synchronize(device)
                 step_start = time.perf_counter()
-                logits = gpt(input)
+                logits, kv_cache = gpt(
+                    input,
+                    pos=torch.tensor([pos]).unsqueeze(0).to(device)
+                    if cache_enabled
+                    else None,
+                    kv_cache=kv_cache if cache_enabled else None,
+                )
                 synchronize(device)
                 step_time = time.perf_counter() - step_start
                 if ttft is None:
                     ttft = step_time
                 if benchmark == Benchmark.SYNCHRONIZE:
-                    step_times.append((len(token_ids), step_time))
+                    print(f"  [{len(token_ids):5d} tokens]  {step_time * 1000:.1f}ms")
             else:
-                logits = gpt(input)
+                logits, kv_cache = gpt(
+                    input,
+                    pos=torch.tensor([pos]).unsqueeze(0).to(device)
+                    if cache_enabled
+                    else None,
+                    kv_cache=kv_cache if cache_enabled else None,
+                )
 
             next_token = logits[0, -1].argmax().to("cpu").item()
             token_ids.append(next_token)
             next_token = tokenizer.decode([next_token])
-            print(next_token, end="")
+            pos += 1
             result += next_token
-
-            if i == 500:
-                proc = psutil.Process(os.getpid())
-                print("INFERENCE PROCESS MEMORY USAGE")
-                print(proc.memory_info().rss / 1e9, "GB")
 
     if benchmark != Benchmark.OFF:
         total_time = time.perf_counter() - gen_start
@@ -74,15 +100,12 @@ def inference(
 
         print(f"\n\n--- Benchmark ---")
         print(f"Model load:   {load_time:.2f}s")
-        print(f"TTFT:         {ttft * 1000:.1f}ms")
+        if ttft:
+            print(f"TTFT:         {ttft * 1000:.1f}ms")
         print(f"Throughput:   {throughput:.2f} tokens/sec")
         print(f"Total time:   {total_time:.2f}s")
         if memory_gb is not None:
             print(f"Memory usage: {memory_gb:.2f} GB")
-        if benchmark == Benchmark.SYNCHRONIZE:
-            print(f"\nPer-step latency (seq_len, time_ms):")
-            for seq_len, t in step_times:
-                print(f"  {seq_len:5d}  {t * 1000:.1f}ms")
 
     return result
 

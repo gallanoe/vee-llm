@@ -16,7 +16,7 @@ class Tokenizer:
         return self.tok.encode(text)
 
     def decode(self, ids: list[int]) -> str:
-        return self.tok.decode(ids)
+        return self.tok.decode(ids)  # type: ignore
 
 
 def gelu(x):
@@ -69,46 +69,67 @@ class CausalSelfAttention(torch.nn.Module):
         )
 
     def forward(
-        self, x: Float[Tensor, "batch_size seq_len dim"]
-    ) -> Float[Tensor, "batch_size seq_len dim"]:
+        self,
+        x: Float[Tensor, "batch_size seq_len dim"],
+        kv_cache: tuple[
+            Float[Tensor, "batch_size n_heads cache_len head_dim"],
+            Float[Tensor, "batch_size n_heads cache_len head_dim"],
+        ]
+        | None = None,
+    ) -> tuple[
+        Float[Tensor, "batch_size seq_len dim"],
+        tuple[
+            Float[Tensor, "batch_size n_heads new_cache_len head_dim"],
+            Float[Tensor, "batch_size n_heads new_cache_len head_dim"],
+        ]
+        | None,
+    ]:
         batch_size, seq_len, dim = x.shape
-        q: Float[Tensor, "batch_size seq_len dim"]
-        k: Float[Tensor, "batch_size seq_len dim"]
-        v: Float[Tensor, "batch_size seq_len dim"]
         q, k, v = self.c_attn(x).chunk(3, dim=2)
-        qh: Float[Tensor, "batch_size n_heads seq_len head_dim"] = q.reshape(
-            batch_size, seq_len, self.n_heads, self.head_dim
-        ).transpose(1, 2)
-        kh: Float[Tensor, "batch_size n_heads seq_len head_dim"] = k.reshape(
-            batch_size, seq_len, self.n_heads, self.head_dim
-        ).transpose(1, 2)
-        vh: Float[Tensor, "batch_size n_heads seq_len head_dim"] = v.reshape(
-            batch_size, seq_len, self.n_heads, self.head_dim
-        ).transpose(1, 2)
-        sh: Float[Tensor, "batch_size n_heads seq_len seq_len"] = (
-            qh @ kh.transpose(2, 3) / np.sqrt(self.head_dim)
-        ).masked_fill(
-            ~self.mask[:seq_len, :seq_len], -torch.inf
+        qh = q.reshape(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        kh = k.reshape(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        vh = v.reshape(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        mask = ~self.mask[:seq_len, :seq_len]  # type: ignore
+        sh = (qh @ kh.transpose(2, 3) / np.sqrt(self.head_dim)).masked_fill(
+            mask, -torch.inf
         )  # pre-normalized scores
         sh = torch.nn.functional.softmax(sh, dim=3)
-        wvh: Float[Tensor, "batch_size n_heads seq_len head_dim"] = sh @ vh
-        return self.c_proj(wvh.transpose(1, 2).reshape(batch_size, seq_len, dim))
+        output = self.c_proj(
+            (sh @ vh).transpose(1, 2).reshape(batch_size, seq_len, dim)
+        )
+        return output, None
 
 
 class TransformerBlock(torch.nn.Module):
     def __init__(self, n_heads: int, dim: int, max_seq_len: int):
         super().__init__()
         self.ln_1 = LayerNorm(dim)
-        self.attn = CausalSelfAttention(n_heads, dim, max_seq_len)
+        # self.attn = CausalSelfAttention(n_heads, dim, max_seq_len)
+        self.attn = CausalSelfAttentionKVCache(n_heads, dim, max_seq_len)
         self.ln_2 = LayerNorm(dim)
         self.mlp = MultiLayerPerception(dim)
 
     def forward(
-        self, x: Float[Tensor, "batch_size seq_len dim"]
-    ) -> Float[Tensor, "batch_size seq_len dim"]:
-        x = x + self.attn(self.ln_1(x))
+        self,
+        x: Float[Tensor, "batch_size seq_len dim"],
+        kv_cache: tuple[
+            Float[Tensor, "batch_size n_heads cache_len head_dim"],
+            Float[Tensor, "batch_size n_heads cache_len head_dim"],
+        ]
+        | None = None,
+    ) -> tuple[
+        Float[Tensor, "batch_size seq_len dim"],
+        tuple[
+            Float[Tensor, "batch_size n_heads new_cache_len head_dim"],
+            Float[Tensor, "batch_size n_heads new_cache_len head_dim"],
+        ]
+        | None,
+    ]:
+        new_x = self.ln_1(x)
+        new_x, kv_cache = self.attn(new_x, kv_cache)
+        x = x + new_x
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, kv_cache
 
 
 class Transformer(torch.nn.Module):
@@ -128,14 +149,36 @@ class Transformer(torch.nn.Module):
         self.ln_f = LayerNorm(dim)
 
     def forward(
-        self, x: Int[Tensor, "batch_size seq_len"]
-    ) -> Float[Tensor, "batch_size seq_len dim"]:
+        self,
+        x: Int[Tensor, "batch_size seq_len"],
+        pos: Int[Tensor, "batch_size seq_len"] | None = None,
+        kv_cache: list[
+            tuple[
+                Float[Tensor, "batch_size n_heads cache_len head_dim"],
+                Float[Tensor, "batch_size n_heads cache_len head_dim"],
+            ]
+        ]
+        | None = None,
+    ) -> tuple[
+        Float[Tensor, "batch_size seq_len dim"],
+        list[
+            tuple[
+                Float[Tensor, "batch_size n_heads new_cache_len head_dim"],
+                Float[Tensor, "batch_size n_heads new_cache_len head_dim"],
+            ]
+        ]
+        | None,
+    ]:
         seq_len = x.shape[1]
-        pos = torch.arange(seq_len, device=self.wte.weight.device)
+        if not pos:
+            pos = torch.arange(seq_len, device=self.wte.weight.device)
         x = self.wte(x) + self.wpe(pos)
-        for h in self.h:
-            x = h(x)
-        return self.ln_f(x)
+        new_kv_cache = []
+        for i, h in enumerate(self.h):
+            cache_block = kv_cache[i] if kv_cache else None
+            x, new_cache_block = h(x, cache_block)
+            new_kv_cache.append(new_cache_block)
+        return self.ln_f(x), new_kv_cache
 
 
 class GPT2(torch.nn.Module):
@@ -144,10 +187,28 @@ class GPT2(torch.nn.Module):
         self.transformer = Transformer()
 
     def forward(
-        self, x: Int[Tensor, "batch_size seq_len"]
-    ) -> Float[Tensor, "batch_size seq_len vocab_size"]:
-        x = self.transformer(x)
-        return x @ self.transformer.wte.weight.T
+        self,
+        x: Int[Tensor, "batch_size seq_len"],
+        pos: Int[Tensor, "batch_size seq_len"] | None = None,
+        kv_cache: list[
+            tuple[
+                Float[Tensor, "batch_size n_heads cache_len head_dim"],
+                Float[Tensor, "batch_size n_heads cache_len head_dim"],
+            ]
+        ]
+        | None = None,
+    ) -> tuple[
+        Float[Tensor, "batch_size seq_len vocab_size"],
+        list[
+            tuple[
+                Float[Tensor, "batch_size n_heads new_cache_len head_dim"],
+                Float[Tensor, "batch_size n_heads new_cache_len head_dim"],
+            ]
+        ]
+        | None,
+    ]:
+        x, kv_cache = self.transformer(x, pos, kv_cache)
+        return x @ self.transformer.wte.weight.T, kv_cache
 
     @classmethod
     def from_pretrained(cls, device: str):
@@ -166,3 +227,46 @@ class GPT2(torch.nn.Module):
             torch.cuda.empty_cache()
         gpt.to(device)
         return gpt
+
+
+class CausalSelfAttentionKVCache(CausalSelfAttention):
+    def forward(
+        self,
+        x: Float[Tensor, "batch_size seq_len dim"],
+        kv_cache: tuple[
+            Float[Tensor, "batch_size n_heads cache_len head_dim"],
+            Float[Tensor, "batch_size n_heads cache_len head_dim"],
+        ]
+        | None = None,
+    ) -> tuple[
+        Float[Tensor, "batch_size seq_len dim"],
+        tuple[
+            Float[Tensor, "batch_size n_heads new_cache_len head_dim"],
+            Float[Tensor, "batch_size n_heads new_cache_len head_dim"],
+        ],
+    ]:
+        batch_size, seq_len, dim = x.shape
+        q, k, v = self.c_attn(x).chunk(3, dim=2)
+        qh = q.reshape(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        vh = v.reshape(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        kh = k.reshape(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+            kh = torch.cat([k_cache, kh], dim=2)
+            vh = torch.cat([v_cache, vh], dim=2)
+        cache_len = kv_cache[0].shape[2] if kv_cache else 0
+        # qh: [batch_size, n_heads, seq_len, head_dim]
+        # kh: [batch_size, n_heads, seq_len (+ cache_len), head_dim]
+        # vh: [batch_size, n_heads, seq_len (+ cache_len), head_dim]
+        # sh: [batch_size, n_heads, seq_len, seq_len (+ cache_len)]
+        # mask: [:seq_len, :seq_len + cache_len]
+        total_len = seq_len + cache_len
+        mask = ~self.mask[cache_len : cache_len + seq_len, :total_len]  # type: ignore
+        sh = qh @ kh.transpose(2, 3) / np.sqrt(self.head_dim)
+        sh = sh.masked_fill(mask, -torch.inf)
+        sh = torch.nn.functional.softmax(sh, dim=3)
+        output = self.c_proj(
+            (sh @ vh).transpose(1, 2).reshape(batch_size, seq_len, dim)
+        )
+        return output, (kh, vh)

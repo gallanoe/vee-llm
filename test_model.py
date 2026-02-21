@@ -58,7 +58,18 @@ def test_casual_self_attention():
     actual.load_state_dict(expected_state_dict)
 
     x = torch.randn(10, 64, 768)
-    assert torch.allclose(expected(x)[0], actual(x), atol=1e-5)
+    assert torch.allclose(expected(x)[0], actual(x)[0], atol=1e-5)
+
+
+def test_casual_self_attention_kv_cache_no_regression():
+    expected: torch.nn.Module = ref.transformer.h[0].attn  # type: ignore
+    actual = model.CausalSelfAttentionKVCache(12, 768, 1024)
+
+    expected_state_dict = util.transpose_state_dict(expected.state_dict())
+    actual.load_state_dict(expected_state_dict)
+
+    x = torch.randn(10, 64, 768)
+    assert torch.allclose(expected(x)[0], actual(x)[0], atol=1e-5)
 
 
 def test_transformer_block():
@@ -69,7 +80,7 @@ def test_transformer_block():
     actual.load_state_dict(expected_state_dict)
 
     x = torch.randn(10, 64, 768)
-    assert torch.allclose(expected(x)[0], actual(x), atol=1e-4)
+    assert torch.allclose(expected(x)[0], actual(x)[0], atol=1e-4)
 
 
 def test_transformer():
@@ -83,7 +94,7 @@ def test_transformer():
     token_ids = tokenizer.encode("Hello, my name is")
 
     x = torch.tensor(token_ids).unsqueeze(0)  # Convert to batch
-    assert torch.allclose(expected(x)[0], actual(x), atol=1e-4)
+    assert torch.allclose(expected(x)[0], actual(x)[0], atol=1e-4)
 
 
 def test_gpt2():
@@ -97,4 +108,4 @@ def test_gpt2():
     token_ids = tokenizer.encode("Hello, my name is")
 
     x = torch.tensor(token_ids).unsqueeze(0)  # Convert to batch
-    assert torch.allclose(expected(x)[0], actual(x), atol=1e-4)
+    assert torch.allclose(expected(x)[0], actual(x)[0], atol=1e-4)
